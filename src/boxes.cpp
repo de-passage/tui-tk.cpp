@@ -1,9 +1,9 @@
 #include "linux_term.hpp"
 #include "vt100.hpp"
 
+#include "fmt_definitions.hpp"
 #include <algorithm>
 #include <concepts>
-#include <fmt/core.h>
 #include <vector>
 
 // description de l'interface
@@ -41,11 +41,11 @@ void print(screen scr, box b) {
     return;
   }
 
-  fmt::print("{}", b.background_color);
+  dpsg_print("{}", b.background_color);
   for (int y = b.top_left.row; y < max_y; ++y) {
     std::cout << dpsg::vt100::set_cursor(y, b.top_left.col);
     for (int x = b.top_left.x; x < max_x; ++x) {
-      fmt::print("{}", b.background);
+      dpsg_print("{}", b.background);
     }
   }
   std::cout << dpsg::vt100::reset << std::flush;
@@ -81,7 +81,7 @@ void print(screen scr, bordered_box b) {
     std::cout << b.border_color << b.borders[3] << b.background_color;
 
     for (int x = b.top_left.x; x < max_x - 2; ++x) {
-      fmt::print("{}", b.background);
+      dpsg_print("{}", b.background);
     }
 
     std::cout << b.border_color << b.borders[7];

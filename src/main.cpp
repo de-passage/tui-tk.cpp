@@ -1,4 +1,5 @@
 #include "char_stream.hpp"
+#include "fmt_definitions.hpp"
 #include "linux_term.hpp"
 #include "print_events.hpp"
 #include "vt100.hpp"
@@ -6,8 +7,6 @@
 #include <chrono>
 #include <cmath>
 #include <coroutine>
-#include <fmt/chrono.h>
-#include <fmt/core.h>
 #include <sys/poll.h>
 #include <thread>
 #include <vector>
@@ -230,7 +229,7 @@ public:
 
         if (!same_colors(p, last)) {
           different++;
-          fmt::format_to(std::back_inserter(output),
+          dpsg_format_to(std::back_inserter(output),
                          "\033[0;48;2;{};{};{};38;2;{};{};{}", p.bg.r, p.bg.g,
                          p.bg.b, p.fg.r, p.fg.g, p.fg.b);
           if (p.flags.bold) {
@@ -247,20 +246,20 @@ public:
           if (p.code[0] == 033 || p.code[0] == 0) {
             output += ("m ");
           } else {
-            fmt::format_to(std::back_inserter(output), "m{}", p.code);
+            dpsg_format_to(std::back_inserter(output), "m{}", p.code);
           }
         } else {
           same++;
           if (p.code[0] == 033 || p.code[0] == 0) {
             output += (" ");
           } else {
-            fmt::format_to(std::back_inserter(output), "{}", p.code);
+            dpsg_format_to(std::back_inserter(output), "{}", p.code);
           }
         }
         last = p;
       }
     }
-    fmt::print("{}", output);
+    dpsg_print("{}", output);
   }
 
   void redraw() {
@@ -475,14 +474,14 @@ void display_ui(const ui_representation &ui) {
     fps_counter.compute_frame_duration();
     fps_counter.rearm_timer();
 
-    fps_label = fmt::format("{:.2f}FPS", fps_counter.average_fps());
-    fps_duration = fmt::format("{}", fps_counter.last_frame_duration());
+    fps_label = dpsg_format("{:.2f}FPS", fps_counter.average_fps());
+    fps_duration = dpsg_format("{}", fps_counter.last_frame_duration());
 
     auto diff =
         (std::chrono::nanoseconds(1s) / 60) - fps_counter.last_frame_duration();
-    diff_label = fmt::format("Should wait for: {}", diff);
+    diff_label = dpsg_format("Should wait for: {}", diff);
     frame_counter_label =
-        fmt::format("Processed {} frames", fps_counter.frame_count());
+        dpsg_format("Processed {} frames", fps_counter.frame_count());
 
     if (diff > std::chrono::milliseconds(1)) {
       std::this_thread::sleep_for(diff);

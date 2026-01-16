@@ -34,18 +34,37 @@ concept InfiniteCharacterSequence = requires(T obj, const T& cobj) {
 };
 }
 
+/**
+ * @brief Exception thrown when a POSIX syscall fails and sets errno.
+ *
+ * Wraps the C `errno` value and presents the platform error string
+ * via `std::runtime_error`'s message.
+ */
 struct errno_exception : std::runtime_error {
   errno_exception() : std::runtime_error(strerror(errno)) {}
 
+  /** The raw errno value captured at construction. */
   int code{errno};
 };
 
+/**
+ * @brief Base class for errors encountered while parsing terminal
+ *        control (VT100/ANSI) sequences.
+ *
+ * Subclasses provide a small buffer view of the bytes that produced
+ * the error via `buffer()`.
+ */
 struct invalid_sequence : std::runtime_error {
 
   template <typename T>
     requires std::is_constructible_v<std::runtime_error, T>
   invalid_sequence(T &&param) : std::runtime_error(std::forward<T>(param)) {}
 
+  /**
+   * @brief Returns a view of the input bytes that caused the parse error.
+   *
+   * Implementations must return a contiguous view to aid diagnostics.
+   */
   [[nodiscard]] virtual std::string_view buffer() const = 0;
 };
 
@@ -75,6 +94,13 @@ public:
 };
 } // namespace detail
 
+/**
+ * @brief Error for an incomplete numeric parameter sequence inside an
+ *        escape/control sequence (e.g. CSI sequences that end unexpectedly).
+ *
+ * The template parameter `BufSize` controls the internal copy buffer
+ * size used for diagnostics.
+ */
 template <size_t BufSize>
 struct unfinished_numeric_sequence : detail::invalid_sequence_impl<BufSize> {
   unfinished_numeric_sequence(const char *buf, size_t last, const u16 *beg,
@@ -114,6 +140,11 @@ unfinished_numeric_sequence(char (&)[BufSize], size_t last, const u16 *beg,
 
 template <size_t BufSize>
 struct invalid_sequence_start : detail::invalid_sequence_impl<BufSize> {
+  /**
+   * @brief Construct from a fixed-size buffer and the offending start char.
+   * @param buf Diagnostic buffer containing the input bytes.
+   * @param c The unexpected character that started the invalid sequence.
+   */
   invalid_sequence_start(const char (&buf)[BufSize], char c)
       : invalid_sequence_start{buf, BufSize, c} {}
   invalid_sequence_start(const char *buf, size_t last, char c)
@@ -132,6 +163,11 @@ invalid_sequence_start(char (&)[BufSize], size_t last, char c)
 
 template <size_t BufSize>
 struct invalid_function_key : detail::invalid_sequence_impl<BufSize> {
+  /**
+   * @brief Error type used when a function-key escape sequence is malformed.
+   * @param buf Diagnostic buffer containing the input bytes.
+   * @param c The unexpected character that terminated the function key.
+   */
   invalid_function_key(const char (&buf)[BufSize], char c)
       : invalid_function_key{buf, BufSize, c} {}
   invalid_function_key(const char *buf, size_t last, char c)
@@ -148,6 +184,18 @@ template <size_t BufSize>
 invalid_function_key(char (&)[BufSize], size_t last, char c)
     -> invalid_function_key<BufSize>;
 
+/**
+ * @brief Enable raw-ish terminal mode by clearing the given local flags.
+ *
+ * This helper reads the current terminal attributes into `ctx`, clears the
+ * provided `new_mode` bits from `c_lflag` and applies the modified attributes
+ * with `tcsetattr`. On failure the process will `exit(1)` after printing an
+ * error; callers should prefer the RAII wrapper `raw_mode_context_basic`.
+ *
+ * @param ctx Pointer to a `termios` struct that will be populated with the
+ *            previous terminal attributes (and used to restore them).
+ * @param new_mode Bitmask of local `c_lflag` flags to clear.
+ */
 inline void raw_mode_enable(struct termios *ctx, int new_mode) {
   if (tcgetattr(STDIN_FILENO, ctx) < 0) {
     perror("tcgetattr");
@@ -161,6 +209,12 @@ inline void raw_mode_enable(struct termios *ctx, int new_mode) {
   }
 }
 
+/**
+ * @brief Restore terminal attributes from `ctx`.
+ *
+ * This is the inverse of `raw_mode_enable` and writes the provided
+ * `termios` settings back to `STDIN_FILENO`.
+ */
 inline void raw_mode_disable(struct termios *ctx) {
   tcsetattr(STDIN_FILENO, TCSAFLUSH, ctx);
 }
@@ -173,20 +227,51 @@ inline void raw_mode_disable(struct termios *ctx) {
 // 1006 SET_SGR_EXT_MODE_MOUSE // Same as default mode but positions are encoded
 // in ASCII, allowing for arbitrary positions
 
+/**
+ * @name Mouse / cursor helpers
+ * Helpers that write the appropriate VT100/DECRST/DECSGR sequences to
+ * stdout to enable/disable mouse tracking or query the cursor position.
+ *@{
+ */
+
+/**
+ * @brief Enable XTerm-style mouse tracking (SET_ANY_EVENT + SGR mode).
+ *
+ * Sends the escape sequences required by many terminals to enable mouse
+ * position+button reporting. This is a low-level helper; prefer the
+ * RAII `raw_mode_context_basic::enable_mouse_t` for scoped usage.
+ */
 inline void enable_mouse_tracking() {
   write(STDOUT_FILENO, "\033[?1003h", 8); // enable SET_ANY_EVENT_MOUSE
   write(STDOUT_FILENO, "\033[?1006h", 8); // enable SET_SGR_EXT_MODE_MOUSE
   fsync(STDOUT_FILENO);
 }
 
+/**
+ * @brief Disable previously enabled mouse tracking modes.
+ */
 inline void disable_mouse_tracking() {
   write(STDOUT_FILENO, "\033[?1006l", 8); // disable SET_SGR_EXT_MODE_MOUSE
   write(STDOUT_FILENO, "\033[?1003l", 8); // disable SET_ANY_EVENT_MOUSE
   fsync(STDOUT_FILENO);
 }
 
+/**
+ * @brief Query the terminal for the current cursor position (CSI 6n).
+ *
+ * The response is sent to stdin as a control sequence and parsed by the
+ * event stream code paths into a `event::special` with a `cursor_position`.
+ */
 inline void query_cursor_position() { write(STDOUT_FILENO, "\033[6n", 4); }
 
+/*@}*/
+
+/**
+ * @brief Simple (column,row) or (x,y) terminal co-ordinate pair.
+ *
+ * The union provides both names: `col,row` and `x,y` depending on the
+ * calling code's preference. Values are stored in `u16`.
+ */
 struct term_position {
   union {
     struct {
@@ -199,13 +284,29 @@ struct term_position {
     };
   };
 };
+/**
+ * @brief Terminal size in columns and rows.
+ */
 struct terminal_size {
   u16 col;
   u16 row;
 };
 
+/**
+ * @brief A compact 8-byte tagged union representing an input event.
+ *
+ * Events are one of `key`, `mouse` or `special`. The compact layout keeps
+ * instances small for efficient queueing and copying between threads.
+ */
 struct event {
 
+  /**
+   * @brief Keyboard event representation.
+   *
+   * Stores a single UTF-8 codepoint (up to 4 bytes) in `data` along with
+   * modifier flags. `Key_Marker` in `mods` is used to distinguish key
+   * events from other union variants.
+   */
   struct key {
     enum class funckey_modifiers : u8 {
       Shift = 2,
@@ -217,6 +318,9 @@ struct event {
       Shift_Alt_Control = 8
     };
 
+    /**
+     * @brief Modifier flags for keys.
+     */
     enum class modifiers : u8 {
       None = 0,
       Shift = 4,
@@ -227,6 +331,7 @@ struct event {
       Key_Marker = 1 << 7,
     };
 
+    /** Default construct an empty key. */
     explicit constexpr key() = default;
     explicit constexpr key(char value,
                            key::modifiers mods = key::modifiers::None) noexcept
@@ -260,10 +365,16 @@ struct event {
       return left;
     }
 
+    /**
+     * @brief True if the stored bytes represent a multi-byte UTF-8 lead byte.
+     */
     [[nodiscard]] constexpr bool is_unicode() const {
       return (((u32)code >> 6) & 0b11) == 0b11;
     }
 
+    /**
+     * @brief Number of bytes in the stored UTF-8 codepoint.
+     */
     [[nodiscard]] constexpr size_t code_point_count() const {
       if (code >= 0) {
         return 1;
@@ -271,19 +382,31 @@ struct event {
       return std::countl_one((unsigned char)code);
     }
 
+    /**
+     * @brief Returns a view over the underlying bytes that make up the
+     *        key's codepoint(s).
+     */
     [[nodiscard]] constexpr std::string_view code_points() const {
       return std::string_view{data, code_point_count()};
     }
 
+    /**
+     * @brief Compares codepoints and whether the key is a function key.
+     */
     [[nodiscard]] constexpr bool same_key(key other) const {
       return code_points() == other.code_points() &&
              is_function_key() == other.is_function_key();
     }
 
+    /**
+     * @brief True if this `key` represents a terminal function key.
+     */
     [[nodiscard]] constexpr bool is_function_key() const {
       return (mods & modifiers::Special) == modifiers::Special;
     }
 
+    /** @name Modifier accessors */
+    /** @{ */
     [[nodiscard]] constexpr bool ctrl_pressed() const {
       return (mods & modifiers::Ctrl) == modifiers::Ctrl;
     }
@@ -293,10 +416,17 @@ struct event {
     }
 
     [[nodiscard]] constexpr bool shift_pressed() const {
+    /** @} */
       return (mods & modifiers::Shift) == modifiers::Shift;
     }
   }; // struct key
 
+  /**
+   * @brief Mouse event representation.
+   *
+   * Contains cursor coordinates and a small modifiers bitset which encodes
+   * button, shift/alt/ctrl and release/move indicators.
+   */
   struct mouse {
     enum class buttons {
       Left = 0,
@@ -322,6 +452,7 @@ struct event {
       Key_Marker = 1 << 7,
     };
 
+    /** Default construct an empty mouse event. */
     explicit constexpr mouse() = default;
     explicit constexpr mouse(modifiers magic, term_position pos) noexcept
         : x{pos.col}, y{pos.row}, mods(magic) {}
@@ -333,22 +464,28 @@ struct event {
     u8 _padding[3];
     modifiers mods;
 
+    /**
+     * @brief Returns the canonical button encoded in `mods`.
+     */
     [[nodiscard]] constexpr buttons button() const noexcept {
       return (buttons)(mods &
                        (modifiers) ~(u8)(modifiers::Release | modifiers::Shift |
                                          modifiers::Alt | modifiers::Ctrl));
     }
 
+    /** True if the event corresponds to a press (not a release). */
     [[nodiscard]] constexpr bool is_pressed() const noexcept {
       return (mods & modifiers::Release) == modifiers::None;
     }
 
+    /** True if the event corresponds to a release. */
     [[nodiscard]] constexpr bool is_released() const noexcept {
       return (mods & modifiers::Release) != modifiers::None;
     }
 
+    /** Bitwise operators for the modifiers enum. */
     friend constexpr modifiers operator&(modifiers left,
-                                         modifiers right) noexcept {
+                       modifiers right) noexcept {
       return static_cast<modifiers>(static_cast<u8>(left) &
                                     static_cast<u8>(right));
     }
@@ -363,6 +500,7 @@ struct event {
                                     static_cast<u8>(right));
     }
 
+    /** Compare only the button part of two mouse events. */
     friend constexpr bool same_button(mouse left, mouse right) noexcept {
       return left.button() == right.button();
     }
@@ -379,11 +517,19 @@ struct event {
       return (mods & modifiers::Shift) == modifiers::Shift;
     }
 
+    /**
+     * @brief Returns the cursor position as a `term_position`.
+     */
     [[nodiscard]] constexpr term_position cursor() const noexcept {
       return {.x = x, .y = y};
     }
   }; // struct mouse
 
+  /**
+   * @brief Special non-key/mouse events carried inside the `event` union.
+   *
+   * Examples: cursor position responses from the terminal.
+   */
   struct special {
     constexpr special(term_position p) : pos{.position = p} {}
     enum class type : u8 {
@@ -414,6 +560,7 @@ struct event {
     }
   };
 
+  /** Default construct an empty event (zeroed). */
   explicit constexpr event() noexcept : _cheat_{0} {}
   constexpr event(key key) noexcept : key_{key} {}
   constexpr event(special spec) noexcept : special_{spec} {}
@@ -429,6 +576,10 @@ struct event {
     u64 _cheat_;
   };
 
+  /** @name Event type helpers
+   * Convenience accessors to identify the stored variant.
+   */
+  /** @{ */
   [[nodiscard]] bool is_key_event() const noexcept {
     return ((u8)event::mouse::modifiers::Key_Marker & mods_) != 0;
   }
@@ -453,6 +604,7 @@ struct event {
     return ((u8)mouse::modifiers::Shift & mods_) != 0;
   }
 
+  /** Compare two events for equality. */
   friend constexpr bool operator==(event left, event right) noexcept {
     if (std::is_constant_evaluated()) {
       if (left.is_key_event()) {
@@ -464,12 +616,18 @@ struct event {
     return left._cheat_ == right._cheat_;
   }
 
+  /**
+   * @brief Access the event as a `key`.
+   *
+   * Asserts in non-constexpr execution if the stored variant is not a key.
+   */
   [[nodiscard]] constexpr key get_key() const noexcept {
     if (!std::is_constant_evaluated()) {
       assert(is_key_event());
     }
     return key_;
   }
+  /** Mutable access to the stored `key`. */
   [[nodiscard]] constexpr key &get_key() noexcept {
     if (!std::is_constant_evaluated()) {
       assert(is_key_event());
@@ -477,12 +635,18 @@ struct event {
     return key_;
   }
 
+  /**
+   * @brief Access the event as a `mouse`.
+   *
+   * Asserts in non-constexpr execution if the stored variant is not a mouse.
+   */
   [[nodiscard]] constexpr mouse get_mouse() const noexcept {
     if (!std::is_constant_evaluated()) {
       assert(is_mouse_event());
     }
     return mouse_;
   }
+  /** Mutable access to the stored `mouse`. */
   [[nodiscard]] constexpr mouse &get_mouse() noexcept {
     if (!std::is_constant_evaluated()) {
       assert(is_mouse_event());
@@ -491,8 +655,15 @@ struct event {
   }
 };
 static_assert(sizeof(event) == 8);
+/**
+ * @brief Generator type that yields parsed `event` values.
+ */
 using event_stream = ::dpsg::generator<event>;
 
+/**
+ * @brief Predefined events and small DSL helpers for constructing
+ *        `event::key` values used throughout the codebase.
+ */
 namespace term_events {
 
 template <typename EvType, typename EvType::modifiers Mod>
@@ -619,8 +790,22 @@ extern struct termios orig_termios;
 extern bool require_mouse;
 } // namespace detail
 
+/**
+ * @brief RAII helper that enables a chosen set of local terminal flags
+ *        (raw/cbreak styles) for the scope of the object.
+ *
+ * The template parameter `Mode` is a bitmask of `c_lflag` bits that will be
+ * cleared when the object is constructed and restored on destruction. The
+ * constructor also installs signal handlers to ensure the terminal is
+ * restored on fatal signals or stop/continue events.
+ */
 template <int Mode> struct raw_mode_context_basic {
 
+  /**
+   * @brief Enter raw/cbreak mode and register signal handlers.
+   *
+   * The previous terminal attributes are stored in `detail::orig_termios`.
+   */
   raw_mode_context_basic() noexcept {
     raw_mode_enable(&detail::orig_termios, Mode);
     register_signal_handlers();
@@ -647,7 +832,12 @@ private:
                 detail::INDEX_HANDLER_SIGTSTP);
   }
 
-  // Called on interuption from the outside (Ctrl-Z)
+  /**
+   * @brief Signal handler for SIGTSTP (suspend via Ctrl-Z).
+   *
+   * Restores terminal state and disables mouse tracking before re-raising
+   * the signal so the default behaviour occurs.
+   */
   static void handle_sigtstp(int sig) {
     set_handler(SIGCONT, &raw_mode_context_basic::handle_sigcont,
                 detail::INDEX_HANDLER_SIGCONT);
@@ -658,7 +848,12 @@ private:
     restore_old_and_raise(sig, detail::INDEX_HANDLER_SIGCONT);
   }
 
-  // Called on continue from the outside (fg/bg)
+  /**
+   * @brief Signal handler for SIGCONT (continue after suspend).
+   *
+   * Re-enables raw mode and mouse tracking as needed, then re-raises the
+   * signal to restore default behaviour.
+   */
   static void handle_sigcont(int sig) {
     set_handler(SIGTSTP, &raw_mode_context_basic::handle_sigtstp,
                 detail::INDEX_HANDLER_SIGTSTP);
@@ -669,6 +864,13 @@ private:
     restore_old_and_raise(sig, detail::INDEX_HANDLER_SIGTSTP);
   }
 
+  /**
+   * @brief Handler for fatal signals (SIGINT, SIGSEGV, etc.).
+   *
+   * Restores terminal attributes and mouse tracking before re-raising the
+   * fatal signal so default platform handlers (core dump, terminate, etc.)
+   * can proceed.
+   */
   static void handle_fatal_signal(int sig) {
     raw_mode_disable(&detail::orig_termios);
     if (detail::require_mouse) {
@@ -684,10 +886,17 @@ public:
   raw_mode_context_basic(raw_mode_context_basic &&) = delete;
   raw_mode_context_basic &operator=(raw_mode_context_basic &&) = delete;
 
+  /**
+   * @brief Restore previous terminal attributes on destruction.
+   */
   ~raw_mode_context_basic() noexcept {
     raw_mode_disable(&detail::orig_termios);
   }
 
+  /**
+   * @brief RAII return type from `enable_mouse_tracking()` that keeps
+   *        mouse tracking active while it is alive.
+   */
   struct enable_mouse_t {
     enable_mouse_t() noexcept {
       ::dpsg::enable_mouse_tracking();
@@ -703,10 +912,24 @@ public:
     const enable_mouse_t &operator=(enable_mouse_t &&) noexcept = delete;
   };
 
-  /// Keep the return object for as long as you want mouse tracking. When it
-  /// goes out of scope, mouse tracking will be disabled.
+  /**
+   * @brief Keep mouse tracking enabled while the returned guard is alive.
+   *
+   * Example: `auto g = ctx.enable_mouse_tracking();` — mouse reporting will
+   * remain active until `g` is destroyed.
+   */
   [[nodiscard]] enable_mouse_t enable_mouse_tracking() { return {}; }
 
+  /**
+   * @brief Coroutine generator that yields raw bytes read from `STDIN_FILENO`.
+   *
+   * This is a low-level blocking input generator implemented with `poll`
+   * and `read`. It yields each read character as a `char` and throws
+   * `errno_exception` on unrecoverable I/O errors.
+   *
+   * @tparam BufSize Size of the internal read buffer used for each `read(2)`.
+   * @tparam Timeout Poll timeout in milliseconds (`-1` = infinite).
+   */
   template <size_t BufSize = 32, int Timeout = -1>
   ::dpsg::generator<char> input_stream() {
     (void)this;
@@ -749,7 +972,18 @@ private:
   constexpr static inline u8 UPPER_BOUND_CTRL_CHARACTERS =
       32; // 32 first values represent ctrl+<char>. 0 is ctrl+` for some reason
 
-  // Return the expected amount of unicode continuation characters
+  /**
+   * @brief Convert a raw input byte into an `event::key` and return the
+   *        number of expected UTF-8 continuation bytes.
+   *
+   * Handles control characters (Ctrl-encoded) and multi-byte UTF-8
+   * continuation logic. The constructed `event` is written to `out`.
+   *
+   * @param c Input byte.
+   * @param mod Initial modifier flags (e.g. Alt when ESC prefix present).
+   * @param out Output event to populate.
+   * @return Number of additional UTF-8 bytes expected after this lead byte.
+   */
   static size_t from_character(char c, event::key::modifiers mod, event &out) {
     // CTRL+<char> is sent as (<char> - 'A' + 1). For some reason, '`' is sent
     // as 0.
@@ -767,6 +1001,12 @@ private:
     return 0;
   };
 
+  /**
+   * @brief Parse a 3-value mouse numeric sequence into an `event::mouse`.
+   *
+   * `numbers` holds [code,x,y] as emitted by the terminal's mouse SGR/CSI
+   * sequences. `mods` is an additional modifier mask applied by the parser.
+   */
   static void parse_mouse(const u16 *numbers, event::mouse::modifiers mods,
                           event &ev) {
     auto magic = (event::mouse::modifiers)numbers[0];
@@ -775,6 +1015,18 @@ private:
     ev = event::mouse{mods | magic, {.x = x, .y = y}};
   }
 
+  /**
+   * @brief Apply function-key modifier encoding to a base function key.
+   *
+   * Many terminal function keys include a numeric modifier (1..8) that
+   * encodes Shift/Alt/Ctrl combinations. This helper maps that numeric
+   * modifier into the `event::key::modifiers` bitset.
+   *
+   * @param c Final character code for the function key (e.g. 'A'..'D').
+   * @param base Base `event` representing the function key without extra
+   *             modifiers.
+   * @param modifiers Numeric modifier value parsed from the control sequence.
+   */
   static event parse_function_key(char c, event base, u16 modifiers) {
     base.get_key().code = c;
     switch ((event::key::funckey_modifiers)modifiers) {
@@ -811,13 +1063,34 @@ private:
   term_position cursor_position_{0xFFFF, 0xFFFF};
 
 public:
+  /**
+   * @brief Query the terminal for the current cursor position (CSI 6n).
+   *
+   * This method sends the query sequence; the response will be parsed into
+   * the event stream and eventually update `cursor_position_`.
+   */
   void query_cursor_position() const {
     (void)this;
     ::dpsg::query_cursor_position();
   }
 
+  /**
+   * @brief Return the last-observed cursor position reported by the
+   *        terminal (or 0xFFFF if unknown).
+   */
   term_position cursor_position() const { return cursor_position_; }
 
+  /**
+   * @brief Coroutine that polls `STDIN_FILENO` and parses incoming bytes
+   *        into high-level `event` values.
+   *
+   * This generator uses `poll()` + `read()` and performs a finite-state
+   * machine parse of VT100 control sequences into `event::key`,
+   * `event::mouse` and `event::special` events.
+   *
+   * @tparam BufSize Buffer size used for raw reads.
+   * @tparam Timeout Poll timeout in milliseconds (0 = non-blocking).
+   */
   template <size_t BufSize = 32, int Timeout = 0>
   event_stream event_stream() {
     (void)this;
@@ -1216,6 +1489,14 @@ public:
     throw errno_exception{};
   }
 
+  /**
+   * @brief Parse events from an `InfiniteCharacterSequence` input source.
+   *
+   * This variant of `event_stream` accepts any object satisfying the
+   * `InfiniteCharacterSequence` concept (see top of file) and parses the
+   * incoming characters into `event` values using the same FSM as the
+   * `poll`-based generator.
+   */
   ::dpsg::generator<event> event_stream(detail::InfiniteCharacterSequence auto input) {
 
     enum class parse_state {
@@ -1548,6 +1829,12 @@ public:
   }
 };
 
+/**
+ * @brief Common RAII typedefs for typical terminal modes.
+ *
+ * `raw_mode_context` disables signals, echo and canonical mode. `cbreak_mode_context`
+ * disables echo and canonical mode only.
+ */
 using raw_mode_context = raw_mode_context_basic<ISIG | ECHO | ICANON>;
 using cbreak_mode_context = raw_mode_context_basic<ECHO | ICANON>;
 
@@ -1557,18 +1844,32 @@ bool detail::require_mouse{};
 struct sigaction detail::new_sa[MAX_SIGNAL]{}, detail::old_sa[MAX_SIGNAL]{};
 #endif
 
+/**
+ * @brief Convenience helper that constructs a `raw_mode_context`, runs `f`
+ *        and returns its result.
+ */
 template <std::invocable<raw_mode_context &> F>
 std::invoke_result_t<F, raw_mode_context &> with_raw_mode(F &&f) {
   raw_mode_context ctx;
   return f(ctx);
 }
 
+/**
+ * @brief Convenience helper that constructs a `cbreak_mode_context`, runs `f`
+ *        and returns its result.
+ */
 template <std::invocable<cbreak_mode_context &> F>
 std::invoke_result_t<F, cbreak_mode_context &> with_raw_mode(F &&f) {
   cbreak_mode_context ctx;
   return f(ctx);
 }
 
+/**
+ * @brief Query the current terminal dimensions.
+ *
+ * First attempts to read `COLUMNS`/`LINES` environment variables, falling
+ * back to an `ioctl(TIOCGWINSZ)` call. On failure returns {u16(-1), u16(-1)}.
+ */
 inline terminal_size get_terminal_size() {
   struct winsize w;
   char *col = getenv("COLUMNS");
